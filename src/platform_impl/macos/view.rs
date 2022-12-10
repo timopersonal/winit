@@ -18,13 +18,14 @@ use super::appkit::{
 use crate::{
     dpi::{LogicalPosition, LogicalSize},
     event::{
-        DeviceEvent, ElementState, Event, Ime, KeyboardInput, ModifiersState, MouseButton,
-        MouseScrollDelta, TouchPhase, VirtualKeyCode, WindowEvent,
+        DeviceEvent, ElementState, Event, Ime, MouseButton, MouseScrollDelta, TouchPhase,
+        WindowEvent, 
     },
+    keyboard::{Key, KeyCode, ModifiersState, NativeKeyCode},
     platform_impl::platform::{
         app_state::AppState,
         event::{
-            char_to_keycode, check_function_keys, event_mods, modifier_event, scancode_to_keycode,
+            create_key_event, event_mods, modifier_event,
             EventWrapper,
         },
         util,
@@ -70,6 +71,7 @@ pub(super) struct ViewState {
     ime_position: LogicalPosition<f64>,
     pub(super) modifiers: ModifiersState,
     tracking_rect: Option<NSTrackingRectTag>,
+    // phys_modifiers: HashSet<KeyCode>,
     ime_state: ImeState,
     input_source: String,
 
@@ -81,54 +83,6 @@ pub(super) struct ViewState {
     /// True if the current key event should be forwarded
     /// to the application, even during IME
     forward_key_to_app: bool,
-}
-
-fn get_characters(event: &NSEvent, ignore_modifiers: bool) -> String {
-    if ignore_modifiers {
-        event.charactersIgnoringModifiers()
-    } else {
-        event.characters()
-    }
-    .expect("expected characters to be non-null")
-    .to_string()
-}
-
-// As defined in: https://www.unicode.org/Public/MAPPINGS/VENDORS/APPLE/CORPCHAR.TXT
-fn is_corporate_character(c: char) -> bool {
-    matches!(c,
-        '\u{F700}'..='\u{F747}'
-        | '\u{F802}'..='\u{F84F}'
-        | '\u{F850}'
-        | '\u{F85C}'
-        | '\u{F85D}'
-        | '\u{F85F}'
-        | '\u{F860}'..='\u{F86B}'
-        | '\u{F870}'..='\u{F8FF}'
-    )
-}
-
-// Retrieves a layout-independent keycode given an event.
-fn retrieve_keycode(event: &NSEvent) -> Option<VirtualKeyCode> {
-    #[inline]
-    fn get_code(ev: &NSEvent, raw: bool) -> Option<VirtualKeyCode> {
-        let characters = get_characters(ev, raw);
-        characters.chars().next().and_then(char_to_keycode)
-    }
-
-    // Cmd switches Roman letters for Dvorak-QWERTY layout, so we try modified characters first.
-    // If we don't get a match, then we fall back to unmodified characters.
-    let code = get_code(event, false).or_else(|| get_code(event, true));
-
-    // We've checked all layout related keys, so fall through to scancode.
-    // Reaching this code means that the key is layout-independent (e.g. Backspace, Return).
-    //
-    // We're additionally checking here for F21-F24 keys, since their keycode
-    // can vary, but we know that they are encoded
-    // in characters property.
-    code.or_else(|| {
-        let scancode = event.scancode();
-        scancode_to_keycode(scancode).or_else(|| check_function_keys(&get_characters(event, true)))
-    })
 }
 
 declare_class!(
@@ -486,7 +440,9 @@ declare_class!(
             }
             let was_in_preedit = self.state.ime_state == ImeState::Preedit;
 
-            let characters = get_characters(event, false);
+            // let characters = get_characters(event, false);
+            let is_repeat: bool = unsafe { msg_send![event, isARepeat] };
+
             self.state.forward_key_to_app = false;
 
             // The `interpretKeyEvents` function might call
@@ -508,46 +464,28 @@ declare_class!(
             }
 
             let now_in_preedit = self.state.ime_state == ImeState::Preedit;
-
-            let scancode = event.scancode() as u32;
-            let virtual_keycode = retrieve_keycode(event);
-
             self.update_potentially_stale_modifiers(event);
-
             let ime_related = was_in_preedit || now_in_preedit || text_commited;
 
             if !ime_related || self.state.forward_key_to_app || !self.state.ime_allowed {
-                #[allow(deprecated)]
+                let in_ime = self.is_ime_enabled();
+                let key_event = create_key_event(event, true, is_repeat, in_ime, None);
                 let window_event = Event::WindowEvent {
                     window_id,
                     event: WindowEvent::KeyboardInput {
                         device_id: DEVICE_ID,
-                        input: KeyboardInput {
-                            state: ElementState::Pressed,
-                            scancode,
-                            virtual_keycode,
-                            modifiers: event_mods(event),
-                        },
+                        event: key_event,
                         is_synthetic: false,
                     },
                 };
-
                 AppState::queue_event(EventWrapper::StaticEvent(window_event));
-
-                for character in characters.chars().filter(|c| !is_corporate_character(*c)) {
-                    AppState::queue_event(EventWrapper::StaticEvent(Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::ReceivedCharacter(character),
-                    }));
-                }
             }
+
         }
 
         #[sel(keyUp:)]
         fn key_up(&mut self, event: &NSEvent) {
             trace_scope!("keyUp:");
-            let scancode = event.scancode() as u32;
-            let virtual_keycode = retrieve_keycode(event);
 
             self.update_potentially_stale_modifiers(event);
 
@@ -558,12 +496,7 @@ declare_class!(
                     window_id: self.window_id(),
                     event: WindowEvent::KeyboardInput {
                         device_id: DEVICE_ID,
-                        input: KeyboardInput {
-                            state: ElementState::Released,
-                            scancode,
-                            virtual_keycode,
-                            modifiers: event_mods(event),
-                        },
+                        event: create_key_event(event, false, false, false, None),
                         is_synthetic: false,
                     },
                 };
@@ -573,42 +506,49 @@ declare_class!(
         }
 
         #[sel(flagsChanged:)]
-        fn flags_changed(&mut self, event: &NSEvent) {
+        fn flags_changed(&mut self, ns_event: &NSEvent) {
             trace_scope!("flagsChanged:");
+
+            // We'll correct the `is_press` and the `key_override` below.
+            let event = create_key_event(ns_event, false, false, false, Some(KeyCode::SuperLeft));
 
             let mut events = VecDeque::with_capacity(4);
 
             if let Some(window_event) = modifier_event(
-                event,
+                ns_event,
+                &event,
                 NSEventModifierFlags::NSShiftKeyMask,
-                self.state.modifiers.shift(),
+                self.state.modifiers.shift_key(),
             ) {
                 self.state.modifiers.toggle(ModifiersState::SHIFT);
                 events.push_back(window_event);
             }
 
             if let Some(window_event) = modifier_event(
-                event,
+                ns_event,
+                &event,
                 NSEventModifierFlags::NSControlKeyMask,
-                self.state.modifiers.ctrl(),
+                self.state.modifiers.control_key(),
             ) {
-                self.state.modifiers.toggle(ModifiersState::CTRL);
+                self.state.modifiers.toggle(ModifiersState::CONTROL);
                 events.push_back(window_event);
             }
 
             if let Some(window_event) = modifier_event(
-                event,
+                ns_event,
+                &event,
                 NSEventModifierFlags::NSCommandKeyMask,
-                self.state.modifiers.logo(),
+                self.state.modifiers.super_key(),
             ) {
-                self.state.modifiers.toggle(ModifiersState::LOGO);
+                self.state.modifiers.toggle(ModifiersState::SUPER);
                 events.push_back(window_event);
             }
 
             if let Some(window_event) = modifier_event(
-                event,
+                ns_event,
+                &event,
                 NSEventModifierFlags::NSAlternateKeyMask,
-                self.state.modifiers.alt(),
+                self.state.modifiers.alt_key(),
             ) {
                 self.state.modifiers.toggle(ModifiersState::ALT);
                 events.push_back(window_event);
@@ -656,9 +596,9 @@ declare_class!(
         #[sel(cancelOperation:)]
         fn cancel_operation(&mut self, _sender: *const Object) {
             trace_scope!("cancelOperation:");
-            let scancode = 0x2f;
-            let virtual_keycode = scancode_to_keycode(scancode);
-            debug_assert_eq!(virtual_keycode, Some(VirtualKeyCode::Period));
+            // let scancode = 0x2f;
+            // let virtual_keycode = scancode_to_keycode(scancode);
+            // debug_assert_eq!(virtual_keycode, Some(VirtualKeyCode::Period));
 
             let event = NSApp()
                 .currentEvent()
@@ -666,17 +606,16 @@ declare_class!(
 
             self.update_potentially_stale_modifiers(&event);
 
+            let mut event = create_key_event(&event, false, false, false, None);
+            event.physical_key = KeyCode::Unidentified(NativeKeyCode::Unidentified);
+            event.logical_key = Key::Character(".");
+
             #[allow(deprecated)]
             let window_event = Event::WindowEvent {
                 window_id: self.window_id(),
                 event: WindowEvent::KeyboardInput {
                     device_id: DEVICE_ID,
-                    input: KeyboardInput {
-                        state: ElementState::Pressed,
-                        scancode: scancode as _,
-                        virtual_keycode,
-                        modifiers: event_mods(&event),
-                    },
+                    event,
                     is_synthetic: false,
                 },
             };

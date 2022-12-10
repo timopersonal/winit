@@ -95,7 +95,6 @@ pub(self) use crate::platform_impl::Fullscreen;
 pub struct DeviceId {
     uiscreen: *const UIScreen,
 }
-
 impl DeviceId {
     pub const unsafe fn dummy() -> Self {
         DeviceId {
@@ -103,7 +102,6 @@ impl DeviceId {
         }
     }
 }
-
 unsafe impl Send for DeviceId {}
 unsafe impl Sync for DeviceId {}
 
